@@ -163,28 +163,70 @@ def song_colors(num_songs: int, brightness: int = LED_BRIGHTNESS) -> List[Tuple[
 
 
 def led_command(gains: List[float], colors: List[Tuple[int, int, int]],
-                num_pixels: int = NUM_NEOPIXELS) -> str:
+                num_pixels: int = NUM_NEOPIXELS,
+                brightness: float = 1.0) -> str:
     """Build an ``L`` command string from per-song gains and colours.
 
     The 8 NeoPixels are split proportionally between the two active songs
-    so you can *see* the crossfade position on the strip.
+    so you can *see* the crossfade position on the strip.  *brightness*
+    (0.0-1.0) scales all RGB values -- used by BeatDetector to pulse on
+    transients.
     """
+    def _scale(rgb: Tuple[int, int, int]) -> Tuple[int, int, int]:
+        return (int(rgb[0] * brightness),
+                int(rgb[1] * brightness),
+                int(rgb[2] * brightness))
+
     active = [(i, g) for i, g in enumerate(gains) if g > 0.01]
 
     if not active:
         return f"L0,0,0,0,0,0,{num_pixels}"
 
     if len(active) == 1:
-        r, g, b = colors[active[0][0]]
+        r, g, b = _scale(colors[active[0][0]])
         return f"L{r},{g},{b},{r},{g},{b},{num_pixels}"
 
     idx_a, gain_a = active[0]
     idx_b, gain_b = active[1]
-    r1, g1, b1 = colors[idx_a]
-    r2, g2, b2 = colors[idx_b]
+    r1, g1, b1 = _scale(colors[idx_a])
+    r2, g2, b2 = _scale(colors[idx_b])
     split = round(gain_a / (gain_a + gain_b) * num_pixels)
     split = max(0, min(num_pixels, split))
     return f"L{r1},{g1},{b1},{r2},{g2},{b2},{split}"
+
+
+# ---------------------------------------------------------------------------
+# Beat detection
+# ---------------------------------------------------------------------------
+
+class BeatDetector:
+    """Pulse a 0-1 brightness value in response to audio energy spikes.
+
+    Keeps a slow-moving average of RMS energy.  When the instantaneous
+    energy jumps above the average by *threshold*, a flash is triggered
+    that decays exponentially.  A minimum floor keeps the LEDs always
+    somewhat visible.
+    """
+
+    def __init__(self, threshold: float = 1.5, decay: float = 0.78,
+                 floor: float = 0.20):
+        self._avg = 0.0
+        self._flash = 0.0
+        self._threshold = threshold
+        self._decay = decay
+        self._floor = floor
+
+    def update(self, rms: float) -> float:
+        """Feed in current RMS energy, get back a brightness 0.0-1.0."""
+        if self._avg < 1e-6:
+            self._avg = rms
+        elif rms > self._avg * self._threshold:
+            self._flash = 1.0
+
+        self._avg = self._avg * 0.93 + rms * 0.07
+        self._flash *= self._decay
+
+        return min(1.0, self._floor + self._flash * (1.0 - self._floor))
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +397,10 @@ def main() -> None:
 
     knob.start()
 
+    # Shared between the audio callback and the main-loop beat detector.
+    # A plain float assignment is atomic enough for a visual effect.
+    current_rms = [0.0]
+
     # ---- audio callback ---------------------------------------------------
     def callback(
         outdata: np.ndarray,
@@ -387,6 +433,7 @@ def main() -> None:
                 mixed += chunk * g
 
         outdata[:] = mixed
+        current_rms[0] = float(np.sqrt(np.mean(mixed * mixed)))
 
     # ---- run --------------------------------------------------------------
     with sd.OutputStream(
@@ -396,22 +443,33 @@ def main() -> None:
         blocksize=BLOCK_SIZE,
         callback=callback,
     ):
+        beat = BeatDetector()
+        tick = 0
         print("Mixer running — Ctrl+C to stop.\n")
         try:
             while True:
                 gains = knob_to_gains(knob.value, num_songs)
+                brightness = beat.update(current_rms[0])
 
-                cmd = led_command(gains, colors)
+                cmd = led_command(gains, colors, brightness=brightness)
                 knob.send(cmd)
 
-                parts = [
-                    f"{names[i]}: {g:.0%}"
-                    for i, g in enumerate(gains)
-                    if g > 0.01
-                ]
-                label = " + ".join(parts) if parts else "silence"
-                print(f"\r  Knob {knob.value:4d}  │  {label:<60s}", end="", flush=True)
-                time.sleep(0.1)
+                # Print status at a readable pace (~5 Hz) while LEDs
+                # update at the full loop rate (~20 Hz).
+                tick += 1
+                if tick % 4 == 0:
+                    parts = [
+                        f"{names[i]}: {g:.0%}"
+                        for i, g in enumerate(gains)
+                        if g > 0.01
+                    ]
+                    label = " + ".join(parts) if parts else "silence"
+                    bar = "█" * int(brightness * 10)
+                    print(
+                        f"\r  Knob {knob.value:4d}  │  {label:<40s} │ ♪ {bar:<10s}",
+                        end="", flush=True,
+                    )
+                time.sleep(0.05)
         except KeyboardInterrupt:
             print("\nStopping...")
 
